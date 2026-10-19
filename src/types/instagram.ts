@@ -35,7 +35,7 @@ export interface InstagramProfile {
   latestReelTimestamp?: number | null;
   recentPosts: InstagramPost[];
   fetchedAt: string;
-  dataSource: 'web_scraper' | 'meta_graph_api';
+  dataSource: 'web_scraper';
 }
 
 export interface ScrapeOptions {

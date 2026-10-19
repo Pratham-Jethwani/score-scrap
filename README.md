@@ -13,8 +13,7 @@ A high-fidelity Node.js + TypeScript scraper and REST API that retrieves all ava
 - **Deep Metrics Support**: Option to fetch exact likes count, comments count, and posting timestamps for recent posts.
 - **Account Type Classification**: Automatically detects whether an account is `BUSINESS_OR_CREATOR`, `PUBLIC_PERSONAL`, or `PRIVATE`.
 - **Exact Numeric Precision**: Extracts exact integer follower and following counts directly from Instagram's internal JSON store (e.g. `17,348,110` instead of a rounded `17M`).
-- **REST API + CLI**: Ready to run as an Express service or terminal command.
-- **Meta Graph API Optional Layer**: Supports querying official Meta Graph API Business Discovery if your Meta App token is configured.
+- **REST API + CLI + Web UI**: Ready to run as a terminal command, Express server, or deployed on Netlify.
 
 ---
 
@@ -74,22 +73,9 @@ npx tsx src/cli.ts <username> --deep
 npx tsx src/cli.ts <username> --json
 ```
 
-Examples:
-```bash
-npx tsx src/cli.ts zuck
-npx tsx src/cli.ts zuck --deep
-npx tsx src/cli.ts privatetest
-```
-
-### 3. Run as REST API
+### 3. Run as Local Web App & REST API
 ```bash
 npm run dev
 ```
 
 Server starts on `http://localhost:3000`.
-
-#### Endpoints:
-- `GET /health`: Health check
-- `GET /api/v1/profile/:username`: Quick profile + recent media previews
-- `GET /api/v1/profile/:username?deep=true&limit=6`: Profile with enriched likes, comments, and post dates
-- `GET /api/v1/meta-graph/:username`: Official Meta Graph query (requires `.env` config)
