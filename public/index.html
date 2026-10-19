@@ -594,13 +594,20 @@
       const statusText = document.getElementById('loading-status-text');
       statusText.textContent = `Querying metadata for @${cleanUsername}...`;
 
-      try {
         const url = `/api/v1/profile/${encodeURIComponent(cleanUsername)}${deep ? '?deep=true&limit=8' : ''}`;
         const res = await fetch(url);
-        const data = await res.json();
+        
+        let data;
+        const text = await res.text();
+        try {
+          data = JSON.parse(text);
+        } catch {
+          showError(`HTTP Error (${res.status})`, `The server returned an unparseable response: ${text.slice(0, 150)}`);
+          return;
+        }
 
         if (!res.ok || !data.success) {
-          showError(`Account "@${cleanUsername}" could not be retrieved.`, data.error || 'User not found or suspended.');
+          showError(`Account "@${cleanUsername}" could not be retrieved.`, data.error || `HTTP ${res.status}`);
           return;
         }
 

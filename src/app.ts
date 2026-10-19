@@ -52,7 +52,9 @@ apiRouter.get('/v1/profile/:username', async (req: Request, res: Response) => {
   }
 });
 
-// Mount router on both '/api' and '/' for seamless Netlify serverless routing
+// Mount router on all Netlify serverless prefix variations as well as local paths
+app.use('/.netlify/functions/api/api', apiRouter);
+app.use('/.netlify/functions/api', apiRouter);
 app.use('/api', apiRouter);
 app.use('/', apiRouter);
 
