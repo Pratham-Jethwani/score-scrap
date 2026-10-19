@@ -3,8 +3,8 @@ import { InstagramProfile, InstagramPost, ScrapeOptions, AccountType } from '../
 import { extractShortcodeFromImageUrl, parseCompactNumber } from '../utils/shortcode.js';
 
 const USER_AGENTS = [
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
   'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)'
 ];
 
@@ -16,32 +16,36 @@ export class InstagramWebScraper {
     const username = rawUsername.trim().toLowerCase().replace(/^@/, '');
     const url = `https://www.instagram.com/${username}/`;
 
-    const userAgent = USER_AGENTS[0];
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': userAgent,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-      },
-    });
+    let html = '';
+    let status = 0;
 
-    if (response.status === 404) {
-      throw new Error(`Account "@${username}" not found (HTTP 404).`);
+    // Try fetching profile with browser user agents
+    for (const ua of USER_AGENTS) {
+      try {
+        const response = await fetch(url, {
+          headers: {
+            'User-Agent': ua,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache',
+          },
+        });
+        status = response.status;
+        if (response.status === 404) {
+          throw new Error(`Account "@${username}" not found (HTTP 404).`);
+        }
+        if (response.ok) {
+          html = await response.text();
+          if (html.includes('follower') || html.includes('biography') || html.includes('og:title')) {
+            break;
+          }
+        }
+      } catch (err: any) {
+        if (err.message?.includes('404')) throw err;
+      }
     }
 
-    if (!response.ok) {
-      throw new Error(`Failed to fetch Instagram profile for "@${username}" (HTTP ${response.status}).`);
-    }
-
-    const html = await response.text();
-    const $ = cheerio.load(html);
-
-    // Validate if the page returned a valid Instagram user profile
-    const pageTitle = $('title').first().text().trim();
-    if (!pageTitle || pageTitle === 'Instagram' || pageTitle.includes('Page Not Found')) {
-      throw new Error(`Account "@${username}" does not exist or is suspended.`);
-    }
+    const $ = cheerio.load(html || '<html><head></head><body></body></html>');
 
     // 1. Check for Embedded JSON blocks (Relay/Polaris xig_user_by_igid_v2)
     const rawUserData = this.extractUserFromScriptJson($);
@@ -49,35 +53,26 @@ export class InstagramWebScraper {
     // 2. Parse Meta Tags for fallback and additional counts
     const metaDesc = $('meta[name="description"]').attr('content') || 
                      $('meta[property="og:description"]').attr('content') || '';
-    const ogTitle = $('meta[property="og:title"]').attr('content') || '';
+    const ogTitle = $('meta[property="og:title"]').attr('content') || $('title').text() || '';
     const ogImage = $('meta[property="og:image"]').attr('content') || '';
 
     const metaParsed = this.parseMetaDescription(metaDesc);
 
-    // 3. Synthesize & prioritize high-fidelity fields
-    const fullName = rawUserData?.full_name || metaParsed.fullName || ogTitle.split('•')[0]?.replace(/\(@[^\)]+\)/, '').trim() || username;
-    const pk = rawUserData?.pk ? String(rawUserData.pk) : null;
-    const metaId = rawUserData?.id ? String(rawUserData.id) : null;
-    const biography = rawUserData?.biography !== undefined ? rawUserData.biography : (metaParsed.bio || '');
-    const isVerified = rawUserData?.is_verified ?? (pageTitle.includes('Verified') || html.includes('Verified'));
-    const isPrivate = rawUserData?.is_private ?? (html.includes('This profile is private') || html.includes('This Account is Private'));
+    // 3. Synthesize fields from main profile
+    let fullName = rawUserData?.full_name || metaParsed.fullName || ogTitle.split('•')[0]?.replace(/\(@[^\)]+\)/, '').trim() || username;
+    let pk = rawUserData?.pk ? String(rawUserData.pk) : null;
+    let metaId = rawUserData?.id ? String(rawUserData.id) : null;
+    let biography = rawUserData?.biography !== undefined ? rawUserData.biography : (metaParsed.bio || '');
+    let isVerified = rawUserData?.is_verified ?? (ogTitle.includes('Verified') || html.includes('Verified'));
+    let isPrivate = rawUserData?.is_private ?? (html.includes('This profile is private') || html.includes('This Account is Private'));
     
-    // Followers & Following count (Prefer exact count from JSON, fallback to meta tag)
-    const followersCount = rawUserData?.follower_count ?? parseCompactNumber(metaParsed.followersStr);
-    const followingCount = rawUserData?.following_count ?? parseCompactNumber(metaParsed.followingStr);
-    const postsCount = parseCompactNumber(metaParsed.postsStr);
+    let followersCount = rawUserData?.follower_count ?? parseCompactNumber(metaParsed.followersStr);
+    let followingCount = rawUserData?.following_count ?? parseCompactNumber(metaParsed.followingStr);
+    let postsCount = parseCompactNumber(metaParsed.postsStr);
 
-    const profilePicUrl = rawUserData?.profile_pic_url || ogImage || null;
+    let profilePicUrl = rawUserData?.profile_pic_url || ogImage || null;
     const hasAnyClips = Boolean(rawUserData?.has_any_clips);
     const latestReelTimestamp = rawUserData?.latest_reel_media ? Number(rawUserData.latest_reel_media) : null;
-
-    // Determine account classification
-    let accountType: AccountType = 'PUBLIC_PERSONAL';
-    if (isPrivate) {
-      accountType = 'PRIVATE';
-    } else if (hasAnyClips || latestReelTimestamp || rawUserData?.category_name || (followersCount > 10000 && isVerified)) {
-      accountType = 'BUSINESS_OR_CREATOR';
-    }
 
     // 4. Extract recent media from DOM (if public)
     const recentPosts: InstagramPost[] = [];
@@ -86,10 +81,9 @@ export class InstagramWebScraper {
         const alt = $(el).attr('alt') || '';
         const src = $(el).attr('src') || '';
 
-        // Filter out profile pictures, icons, and empty images
         if (src && alt && !alt.toLowerCase().includes('profile picture') && !alt.toLowerCase().includes('logo')) {
           const shortcode = extractShortcodeFromImageUrl(src);
-          if (shortcode) {
+          if (shortcode && !recentPosts.some(p => p.shortcode === shortcode)) {
             recentPosts.push({
               shortcode,
               permalink: `https://www.instagram.com/p/${shortcode}/`,
@@ -101,7 +95,48 @@ export class InstagramWebScraper {
       });
     }
 
-    // 5. Optional Deep Enrichment for Recent Posts (Likes, Comments, Timestamps)
+    // 5. Cloud-Proof Fallback (Embed API): If main profile returned zeroed metrics on cloud/Netlify IPs
+    if (followersCount === 0 || recentPosts.length === 0) {
+      const embedData = await this.fetchEmbedFallback(username);
+      if (embedData) {
+        if (followersCount === 0 && embedData.followersCount > 0) {
+          followersCount = embedData.followersCount;
+        }
+        if (postsCount === 0 && embedData.postsCount > 0) {
+          postsCount = embedData.postsCount;
+        }
+        if (embedData.isVerified) isVerified = true;
+        if (embedData.isPrivate) isPrivate = true;
+        if (fullName === username && embedData.fullName) {
+          fullName = embedData.fullName;
+        }
+        if (!profilePicUrl && embedData.profilePicUrl) {
+          profilePicUrl = embedData.profilePicUrl;
+        }
+
+        // Add posts extracted from embed if none found on main profile
+        if (recentPosts.length === 0 && embedData.shortcodes.length > 0) {
+          embedData.shortcodes.slice(0, 12).forEach((sc) => {
+            recentPosts.push({
+              shortcode: sc,
+              permalink: `https://www.instagram.com/p/${sc}/`,
+              imageUrl: `https://www.instagram.com/p/${sc}/media/?size=m`,
+              caption: `Post #${sc}`,
+            });
+          });
+        }
+      }
+    }
+
+    // Determine account classification
+    let accountType: AccountType = 'PUBLIC_PERSONAL';
+    if (isPrivate) {
+      accountType = 'PRIVATE';
+    } else if (hasAnyClips || latestReelTimestamp || rawUserData?.category_name || (followersCount > 10000 && isVerified)) {
+      accountType = 'BUSINESS_OR_CREATOR';
+    }
+
+    // Optional Deep Enrichment for Recent Posts
     if (options.includeDeepPostMetrics && recentPosts.length > 0) {
       const postsToEnrich = recentPosts.slice(0, options.maxDeepPosts || 6);
       await Promise.all(
@@ -109,7 +144,7 @@ export class InstagramWebScraper {
           try {
             await this.enrichPostMetrics(post);
           } catch {
-            // Silently continue if single post enrichment fails
+            // Silently continue
           }
         })
       );
@@ -138,12 +173,65 @@ export class InstagramWebScraper {
   }
 
   /**
+   * Fetches metadata from Instagram's public embed endpoint (bulletproof on cloud/datacenter IPs)
+   */
+  private async fetchEmbedFallback(username: string): Promise<{
+    followersCount: number;
+    postsCount: number;
+    isVerified: boolean;
+    isPrivate: boolean;
+    fullName?: string;
+    profilePicUrl?: string;
+    shortcodes: string[];
+  } | null> {
+    try {
+      const res = await fetch(`https://www.instagram.com/${username}/embed/`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+      });
+
+      if (!res.ok) return null;
+      const html = await res.text();
+
+      const fMatch = html.match(/followers_count[\\"]*:\s*(\d+)/);
+      const pMatch = html.match(/posts_count[\\"]*:\s*(\d+)/);
+      const isVerifiedMatch = html.match(/is_verified[\\"]*:\s*(true|false)/);
+      const isPrivateMatch = html.match(/is_private[\\"]*:\s*(true|false)/);
+      const fnMatch = html.match(/full_name[\\"]*:\s*[\\"]*([^\\"]+)/);
+      const picMatch = html.match(/(https:[^\\\"']+(?:cdninstagram|fbcdn)[^\\\"']+)/);
+
+      const shortcodes: string[] = [];
+      const scRegex = /shortcode[\\"]*:\s*[\\"]*([A-Za-z0-9_-]{10,12})/g;
+      let m;
+      while ((m = scRegex.exec(html)) !== null) {
+        if (!shortcodes.includes(m[1])) {
+          shortcodes.push(m[1]);
+        }
+      }
+
+      return {
+        followersCount: fMatch ? parseInt(fMatch[1], 10) : 0,
+        postsCount: pMatch ? parseInt(pMatch[1], 10) : 0,
+        isVerified: isVerifiedMatch ? isVerifiedMatch[1] === 'true' : false,
+        isPrivate: isPrivateMatch ? isPrivateMatch[1] === 'true' : false,
+        fullName: fnMatch ? this.decodeHtmlEntities(fnMatch[1]) : undefined,
+        profilePicUrl: picMatch ? picMatch[1].replace(/\\/g, '') : undefined,
+        shortcodes,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Enriches a single post with exact likes, comments, and timestamp from its permalink
    */
   async enrichPostMetrics(post: InstagramPost): Promise<void> {
     const response = await fetch(post.permalink, {
       headers: {
-        'User-Agent': USER_AGENTS[0],
+        'User-Agent': USER_AGENTS[1],
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
     });
@@ -154,8 +242,6 @@ export class InstagramWebScraper {
     const $ = cheerio.load(html);
     const ogDesc = $('meta[property="og:description"]').attr('content') || '';
 
-    // Example og:description:
-    // "564K likes, 181K comments - zuck on October 12, 2026: \"...\""
     const match = ogDesc.match(/^([\d.,]+[KMB]?)\s+likes?,\s+([\d.,]+[KMB]?)\s+comments?\s+-\s+.*?\s+on\s+([^:]+):/i);
     if (match) {
       post.likesCount = parseCompactNumber(match[1]);
@@ -204,7 +290,7 @@ export class InstagramWebScraper {
           extractedUser = result;
         }
       } catch {
-        // Continue searching other scripts if JSON.parse fails
+        // Continue searching
       }
     });
 
@@ -212,32 +298,39 @@ export class InstagramWebScraper {
   }
 
   /**
-   * Parses standard Instagram meta description format:
-   * "{followers} Followers, {following} Following, {posts} Posts - {FullName} (@{username}) on Instagram: \"{bio}\""
+   * Parses standard Instagram meta description format independently
    */
   private parseMetaDescription(meta: string) {
     const unescaped = this.decodeHtmlEntities(meta);
-    const regex = /([\d.,]+[KMB]?)\s+Followers,\s+([\d.,]+[KMB]?)\s+Following,\s+([\d.,]+[KMB]?)\s+Posts\s+-\s+(.*?)\s+\(@([^\)]+)\)\s+on\s+Instagram:\s*\"?(.*?)\"?$/i;
-    const match = unescaped.match(regex);
 
-    if (match) {
-      return {
-        followersStr: match[1],
-        followingStr: match[2],
-        postsStr: match[3],
-        fullName: match[4]?.trim(),
-        username: match[5]?.trim(),
-        bio: match[6]?.trim(),
-      };
+    // Extract numbers independently to prevent broken regex matching
+    const followersMatch = unescaped.match(/([\d.,]+[KMB]?)\s+Followers/i);
+    const followingMatch = unescaped.match(/([\d.,]+[KMB]?)\s+Following/i);
+    const postsMatch = unescaped.match(/([\d.,]+[KMB]?)\s+Posts/i);
+
+    // Extract name and bio
+    let fullName = '';
+    let bio = '';
+
+    const bioSplit = unescaped.split(/on Instagram:\s*"/i);
+    if (bioSplit.length > 1) {
+      bio = bioSplit[1].replace(/"$/, '').trim();
+      const namePart = bioSplit[0].split('-').pop() || '';
+      fullName = namePart.replace(/\(@[^\)]+\)/, '').trim();
+    } else {
+      const seePhotos = unescaped.split(/from\s+/i);
+      if (seePhotos.length > 1) {
+        fullName = seePhotos[1].replace(/\(@[^\)]+\)/, '').trim();
+      }
     }
 
     return {
-      followersStr: '0',
-      followingStr: '0',
-      postsStr: '0',
-      fullName: '',
+      followersStr: followersMatch ? followersMatch[1] : '0',
+      followingStr: followingMatch ? followingMatch[1] : '0',
+      postsStr: postsMatch ? postsMatch[1] : '0',
+      fullName,
       username: '',
-      bio: '',
+      bio,
     };
   }
 
