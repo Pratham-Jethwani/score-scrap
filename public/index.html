@@ -594,6 +594,7 @@
       const statusText = document.getElementById('loading-status-text');
       statusText.textContent = `Querying metadata for @${cleanUsername}...`;
 
+      try {
         const url = `/api/v1/profile/${encodeURIComponent(cleanUsername)}${deep ? '?deep=true&limit=8' : ''}`;
         const res = await fetch(url);
         
