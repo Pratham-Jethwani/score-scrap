@@ -19,23 +19,38 @@ export class InstagramWebScraper {
     let html = '';
     let status = 0;
 
+    const sessionId = process.env.INSTAGRAM_SESSION_ID || '';
+    const customCookie = sessionId ? (sessionId.includes('sessionid=') ? sessionId : `sessionid=${sessionId}`) : '';
+
     // Try fetching profile with browser user agents
     for (const ua of USER_AGENTS) {
       try {
-        const response = await fetch(url, {
-          headers: {
-            'User-Agent': ua,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Cache-Control': 'no-cache',
-          },
-        });
+        const headers: Record<string, string> = {
+          'User-Agent': ua,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Cache-Control': 'no-cache',
+          'Sec-Fetch-Mode': 'navigate',
+        };
+        if (customCookie) {
+          headers['Cookie'] = customCookie;
+        }
+
+        const response = await fetch(url, { headers });
         status = response.status;
         if (response.status === 404) {
           throw new Error(`Account "@${username}" not found (HTTP 404).`);
         }
         if (response.ok) {
-          html = await response.text();
+          const bodyText = await response.text();
+          // Skip if Instagram served a redirect to the login page
+          const titleMatch = bodyText.match(/<title>(.*?)<\/title>/i);
+          const pageTitle = titleMatch ? titleMatch[1].trim() : '';
+          if (pageTitle.toLowerCase().includes('login • instagram') || bodyText.includes('/accounts/login/')) {
+            continue;
+          }
+
+          html = bodyText;
           if (html.includes('follower') || html.includes('biography') || html.includes('og:title')) {
             break;
           }
@@ -59,7 +74,10 @@ export class InstagramWebScraper {
     const metaParsed = this.parseMetaDescription(metaDesc);
 
     // 3. Synthesize fields from main profile
-    let fullName = rawUserData?.full_name || metaParsed.fullName || ogTitle.split('•')[0]?.replace(/\(@[^\)]+\)/, '').trim() || username;
+    const titleCandidate = (ogTitle.toLowerCase().includes('login') || ogTitle === 'Instagram') 
+      ? '' 
+      : ogTitle.split('•')[0]?.replace(/\(@[^\)]+\)/, '').trim();
+    let fullName = rawUserData?.full_name || metaParsed.fullName || titleCandidate || username;
     let pk = rawUserData?.pk ? String(rawUserData.pk) : null;
     let metaId = rawUserData?.id ? String(rawUserData.id) : null;
     let biography = rawUserData?.biography !== undefined ? rawUserData.biography : (metaParsed.bio || '');
@@ -71,6 +89,9 @@ export class InstagramWebScraper {
     let postsCount = parseCompactNumber(metaParsed.postsStr);
 
     let profilePicUrl = rawUserData?.profile_pic_url || ogImage || null;
+    if (profilePicUrl && (profilePicUrl.includes('rzWiSjZRxk5') || profilePicUrl.includes('static.cdninstagram.com/rsrc.php'))) {
+      profilePicUrl = null;
+    }
     const hasAnyClips = Boolean(rawUserData?.has_any_clips);
     const latestReelTimestamp = rawUserData?.latest_reel_media ? Number(rawUserData.latest_reel_media) : null;
 
@@ -126,6 +147,12 @@ export class InstagramWebScraper {
           });
         }
       }
+    }
+
+    if (followersCount === 0 && postsCount === 0 && !isPrivate && !biography && recentPosts.length === 0) {
+      throw new Error(
+        `Instagram blocked this cloud IP with a login wall. Please add an INSTAGRAM_SESSION_ID in Netlify Site Settings > Environment Variables, or run the app locally.`
+      );
     }
 
     // Determine account classification
@@ -185,12 +212,16 @@ export class InstagramWebScraper {
     shortcodes: string[];
   } | null> {
     try {
-      const res = await fetch(`https://www.instagram.com/${username}/embed/`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-      });
+      const headers: Record<string, string> = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      };
+      const sessionId = process.env.INSTAGRAM_SESSION_ID || '';
+      if (sessionId) {
+        headers['Cookie'] = sessionId.includes('sessionid=') ? sessionId : `sessionid=${sessionId}`;
+      }
+
+      const res = await fetch(`https://www.instagram.com/${username}/embed/`, { headers });
 
       if (!res.ok) return null;
       const html = await res.text();
