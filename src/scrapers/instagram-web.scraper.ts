@@ -2,11 +2,7 @@ import * as cheerio from 'cheerio';
 import { InstagramProfile, InstagramPost, ScrapeOptions, AccountType } from '../types/instagram.js';
 import { extractShortcodeFromImageUrl, parseCompactNumber } from '../utils/shortcode.js';
 
-const USER_AGENTS = [
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-  'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)'
-];
+const USER_AGENT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
 
 export class InstagramWebScraper {
   /**
@@ -16,51 +12,31 @@ export class InstagramWebScraper {
     const username = rawUsername.trim().toLowerCase().replace(/^@/, '');
     const url = `https://www.instagram.com/${username}/`;
 
-    let html = '';
-    let status = 0;
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+      },
+    });
 
-    const sessionId = process.env.INSTAGRAM_SESSION_ID || '';
-    const customCookie = sessionId ? (sessionId.includes('sessionid=') ? sessionId : `sessionid=${sessionId}`) : '';
-
-    // Try fetching profile with browser user agents
-    for (const ua of USER_AGENTS) {
-      try {
-        const headers: Record<string, string> = {
-          'User-Agent': ua,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Cache-Control': 'no-cache',
-          'Sec-Fetch-Mode': 'navigate',
-        };
-        if (customCookie) {
-          headers['Cookie'] = customCookie;
-        }
-
-        const response = await fetch(url, { headers });
-        status = response.status;
-        if (response.status === 404) {
-          throw new Error(`Account "@${username}" not found (HTTP 404).`);
-        }
-        if (response.ok) {
-          const bodyText = await response.text();
-          // Skip if Instagram served a redirect to the login page
-          const titleMatch = bodyText.match(/<title>(.*?)<\/title>/i);
-          const pageTitle = titleMatch ? titleMatch[1].trim() : '';
-          if (pageTitle.toLowerCase().includes('login • instagram') || bodyText.includes('/accounts/login/')) {
-            continue;
-          }
-
-          html = bodyText;
-          if (html.includes('follower') || html.includes('biography') || html.includes('og:title')) {
-            break;
-          }
-        }
-      } catch (err: any) {
-        if (err.message?.includes('404')) throw err;
-      }
+    if (response.status === 404) {
+      throw new Error(`Account "@${username}" not found (HTTP 404).`);
     }
 
-    const $ = cheerio.load(html || '<html><head></head><body></body></html>');
+    if (!response.ok) {
+      throw new Error(`Failed to fetch Instagram profile for "@${username}" (HTTP ${response.status}).`);
+    }
+
+    const html = await response.text();
+    const $ = cheerio.load(html);
+
+    // Validate if the page returned a valid Instagram user profile
+    const pageTitle = $('title').first().text().trim();
+    if (!pageTitle || pageTitle === 'Instagram' || pageTitle.includes('Page Not Found')) {
+      throw new Error(`Account "@${username}" does not exist or is suspended.`);
+    }
 
     // 1. Check for Embedded JSON blocks (Relay/Polaris xig_user_by_igid_v2)
     const rawUserData = this.extractUserFromScriptJson($);
@@ -68,32 +44,43 @@ export class InstagramWebScraper {
     // 2. Parse Meta Tags for fallback and additional counts
     const metaDesc = $('meta[name="description"]').attr('content') || 
                      $('meta[property="og:description"]').attr('content') || '';
-    const ogTitle = $('meta[property="og:title"]').attr('content') || $('title').text() || '';
+    const ogTitle = $('meta[property="og:title"]').attr('content') || pageTitle || '';
     const ogImage = $('meta[property="og:image"]').attr('content') || '';
 
     const metaParsed = this.parseMetaDescription(metaDesc);
 
-    // 3. Synthesize fields from main profile
-    const titleCandidate = (ogTitle.toLowerCase().includes('login') || ogTitle === 'Instagram') 
-      ? '' 
+    // 3. Synthesize fields
+    const titleCandidate = (ogTitle.toLowerCase().includes('login') || ogTitle === 'Instagram')
+      ? ''
       : ogTitle.split('•')[0]?.replace(/\(@[^\)]+\)/, '').trim();
-    let fullName = rawUserData?.full_name || metaParsed.fullName || titleCandidate || username;
-    let pk = rawUserData?.pk ? String(rawUserData.pk) : null;
-    let metaId = rawUserData?.id ? String(rawUserData.id) : null;
-    let biography = rawUserData?.biography !== undefined ? rawUserData.biography : (metaParsed.bio || '');
-    let isVerified = rawUserData?.is_verified ?? (ogTitle.includes('Verified') || html.includes('Verified'));
-    let isPrivate = rawUserData?.is_private ?? (html.includes('This profile is private') || html.includes('This Account is Private'));
+
+    const fullName = rawUserData?.full_name || metaParsed.fullName || titleCandidate || username;
+    const pk = rawUserData?.pk ? String(rawUserData.pk) : null;
+    const metaId = rawUserData?.id ? String(rawUserData.id) : null;
+    const biography = rawUserData?.biography !== undefined ? rawUserData.biography : (metaParsed.bio || '');
+    const isVerified = rawUserData?.is_verified ?? (ogTitle.includes('Verified') || html.includes('Verified'));
+    const isPrivate = rawUserData?.is_private ?? (html.includes('This profile is private') || html.includes('This Account is Private'));
     
-    let followersCount = rawUserData?.follower_count ?? parseCompactNumber(metaParsed.followersStr);
-    let followingCount = rawUserData?.following_count ?? parseCompactNumber(metaParsed.followingStr);
-    let postsCount = parseCompactNumber(metaParsed.postsStr);
+    // Followers & Following count (Prefer exact count from JSON, fallback to meta tag)
+    const followersCount = rawUserData?.follower_count ?? parseCompactNumber(metaParsed.followersStr);
+    const followingCount = rawUserData?.following_count ?? parseCompactNumber(metaParsed.followingStr);
+    const postsCount = parseCompactNumber(metaParsed.postsStr);
 
     let profilePicUrl = rawUserData?.profile_pic_url || ogImage || null;
     if (profilePicUrl && (profilePicUrl.includes('rzWiSjZRxk5') || profilePicUrl.includes('static.cdninstagram.com/rsrc.php'))) {
       profilePicUrl = null;
     }
+
     const hasAnyClips = Boolean(rawUserData?.has_any_clips);
     const latestReelTimestamp = rawUserData?.latest_reel_media ? Number(rawUserData.latest_reel_media) : null;
+
+    // Determine account classification
+    let accountType: AccountType = 'PUBLIC_PERSONAL';
+    if (isPrivate) {
+      accountType = 'PRIVATE';
+    } else if (hasAnyClips || latestReelTimestamp || rawUserData?.category_name || (followersCount > 10000 && isVerified)) {
+      accountType = 'BUSINESS_OR_CREATOR';
+    }
 
     // 4. Extract recent media from DOM (if public)
     const recentPosts: InstagramPost[] = [];
@@ -102,6 +89,7 @@ export class InstagramWebScraper {
         const alt = $(el).attr('alt') || '';
         const src = $(el).attr('src') || '';
 
+        // Filter out profile pictures, icons, and empty images
         if (src && alt && !alt.toLowerCase().includes('profile picture') && !alt.toLowerCase().includes('logo')) {
           const shortcode = extractShortcodeFromImageUrl(src);
           if (shortcode && !recentPosts.some(p => p.shortcode === shortcode)) {
@@ -116,54 +104,7 @@ export class InstagramWebScraper {
       });
     }
 
-    // 5. Cloud-Proof Fallback (Embed API): If main profile returned zeroed metrics on cloud/Netlify IPs
-    if (followersCount === 0 || recentPosts.length === 0) {
-      const embedData = await this.fetchEmbedFallback(username);
-      if (embedData) {
-        if (followersCount === 0 && embedData.followersCount > 0) {
-          followersCount = embedData.followersCount;
-        }
-        if (postsCount === 0 && embedData.postsCount > 0) {
-          postsCount = embedData.postsCount;
-        }
-        if (embedData.isVerified) isVerified = true;
-        if (embedData.isPrivate) isPrivate = true;
-        if (fullName === username && embedData.fullName) {
-          fullName = embedData.fullName;
-        }
-        if (!profilePicUrl && embedData.profilePicUrl) {
-          profilePicUrl = embedData.profilePicUrl;
-        }
-
-        // Add posts extracted from embed if none found on main profile
-        if (recentPosts.length === 0 && embedData.shortcodes.length > 0) {
-          embedData.shortcodes.slice(0, 12).forEach((sc) => {
-            recentPosts.push({
-              shortcode: sc,
-              permalink: `https://www.instagram.com/p/${sc}/`,
-              imageUrl: `https://www.instagram.com/p/${sc}/media/?size=m`,
-              caption: `Post #${sc}`,
-            });
-          });
-        }
-      }
-    }
-
-    if (followersCount === 0 && postsCount === 0 && !isPrivate && !biography && recentPosts.length === 0) {
-      throw new Error(
-        `Instagram blocked this cloud IP with a login wall. Please add an INSTAGRAM_SESSION_ID in Netlify Site Settings > Environment Variables, or run the app locally.`
-      );
-    }
-
-    // Determine account classification
-    let accountType: AccountType = 'PUBLIC_PERSONAL';
-    if (isPrivate) {
-      accountType = 'PRIVATE';
-    } else if (hasAnyClips || latestReelTimestamp || rawUserData?.category_name || (followersCount > 10000 && isVerified)) {
-      accountType = 'BUSINESS_OR_CREATOR';
-    }
-
-    // Optional Deep Enrichment for Recent Posts
+    // 5. Optional Deep Enrichment for Recent Posts
     if (options.includeDeepPostMetrics && recentPosts.length > 0) {
       const postsToEnrich = recentPosts.slice(0, options.maxDeepPosts || 6);
       await Promise.all(
@@ -200,69 +141,12 @@ export class InstagramWebScraper {
   }
 
   /**
-   * Fetches metadata from Instagram's public embed endpoint (bulletproof on cloud/datacenter IPs)
-   */
-  private async fetchEmbedFallback(username: string): Promise<{
-    followersCount: number;
-    postsCount: number;
-    isVerified: boolean;
-    isPrivate: boolean;
-    fullName?: string;
-    profilePicUrl?: string;
-    shortcodes: string[];
-  } | null> {
-    try {
-      const headers: Record<string, string> = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-      };
-      const sessionId = process.env.INSTAGRAM_SESSION_ID || '';
-      if (sessionId) {
-        headers['Cookie'] = sessionId.includes('sessionid=') ? sessionId : `sessionid=${sessionId}`;
-      }
-
-      const res = await fetch(`https://www.instagram.com/${username}/embed/`, { headers });
-
-      if (!res.ok) return null;
-      const html = await res.text();
-
-      const fMatch = html.match(/followers_count[\\"]*:\s*(\d+)/);
-      const pMatch = html.match(/posts_count[\\"]*:\s*(\d+)/);
-      const isVerifiedMatch = html.match(/is_verified[\\"]*:\s*(true|false)/);
-      const isPrivateMatch = html.match(/is_private[\\"]*:\s*(true|false)/);
-      const fnMatch = html.match(/full_name[\\"]*:\s*[\\"]*([^\\"]+)/);
-      const picMatch = html.match(/(https:[^\\\"']+(?:cdninstagram|fbcdn)[^\\\"']+)/);
-
-      const shortcodes: string[] = [];
-      const scRegex = /shortcode[\\"]*:\s*[\\"]*([A-Za-z0-9_-]{10,12})/g;
-      let m;
-      while ((m = scRegex.exec(html)) !== null) {
-        if (!shortcodes.includes(m[1])) {
-          shortcodes.push(m[1]);
-        }
-      }
-
-      return {
-        followersCount: fMatch ? parseInt(fMatch[1], 10) : 0,
-        postsCount: pMatch ? parseInt(pMatch[1], 10) : 0,
-        isVerified: isVerifiedMatch ? isVerifiedMatch[1] === 'true' : false,
-        isPrivate: isPrivateMatch ? isPrivateMatch[1] === 'true' : false,
-        fullName: fnMatch ? this.decodeHtmlEntities(fnMatch[1]) : undefined,
-        profilePicUrl: picMatch ? picMatch[1].replace(/\\/g, '') : undefined,
-        shortcodes,
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  /**
    * Enriches a single post with exact likes, comments, and timestamp from its permalink
    */
   async enrichPostMetrics(post: InstagramPost): Promise<void> {
     const response = await fetch(post.permalink, {
       headers: {
-        'User-Agent': USER_AGENTS[1],
+        'User-Agent': USER_AGENT,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
     });
@@ -334,7 +218,7 @@ export class InstagramWebScraper {
   private parseMetaDescription(meta: string) {
     const unescaped = this.decodeHtmlEntities(meta);
 
-    // Extract numbers independently to prevent broken regex matching
+    // Extract numbers independently
     const followersMatch = unescaped.match(/([\d.,]+[KMB]?)\s+Followers/i);
     const followingMatch = unescaped.match(/([\d.,]+[KMB]?)\s+Following/i);
     const postsMatch = unescaped.match(/([\d.,]+[KMB]?)\s+Posts/i);
